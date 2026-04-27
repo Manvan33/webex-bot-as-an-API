@@ -6,7 +6,7 @@ import signal
 import requests
 from webexteamssdk import WebexTeamsAPI, ApiError
 import websockets
-from websockets.exceptions import ConnectionClosed, ConnectionClosedError
+from websockets.exceptions import ConnectionClosed, ConnectionClosedError, InvalidStatus
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -34,13 +34,14 @@ class WebexWSClient:
         self.loop = None
         self.handlers = []
 
-    def _get_device_info(self):
-        wdm_url = "https://wdm-a.wbx2.com/wdm/api/v1/devices"
-        headers = {
+    def _wdm_headers(self):
+        return {
             "Authorization": f"Bearer {self.access_token}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
         }
 
+    def _create_device(self):
+        wdm_url = "https://wdm-a.wbx2.com/wdm/api/v1/devices"
         device_data = {
             "deviceName": self.device_name,
             "deviceType": "DESKTOP",
@@ -48,30 +49,58 @@ class WebexWSClient:
             "model": "python",
             "name": self.device_name,
             "systemName": self.device_name,
-            "systemVersion": "1.0"
+            "systemVersion": "1.0",
         }
 
+        create_response = requests.post(wdm_url, headers=self._wdm_headers(), json=device_data)
+        if create_response.status_code == 200:
+            device = create_response.json()
+            logger.info(f"Created new device: {device.get('url')}")
+            return device
+
+        logger.error(f"Failed to create device: {create_response.status_code} - {create_response.text}")
+        return None
+
+    def _delete_current_device(self):
+        if not self.device_info:
+            return
+
+        device_url = self.device_info.get("url")
+        if not device_url:
+            return
+
         try:
-            response = requests.get(wdm_url, headers=headers)
-            if response.status_code == 200:
-                devices = response.json().get("devices", [])
-                for device in devices:
-                    if device.get("name") == self.device_name:
-                        logger.info(f"Using existing device: {device.get('url')}")
-                        return device
+            response = requests.delete(device_url, headers=self._wdm_headers())
+            if response.status_code not in (200, 204, 404):
+                logger.warning(f"Failed deleting stale device: {response.status_code} - {response.text}")
+            else:
+                logger.info(f"Deleted stale device registration: {device_url}")
+        except Exception as exc:
+            logger.warning(f"Error deleting stale device registration: {exc}")
+
+    def _get_device_info(self, force_create=False):
+        wdm_url = "https://wdm-a.wbx2.com/wdm/api/v1/devices"
+
+        try:
+            if not force_create:
+                response = requests.get(wdm_url, headers=self._wdm_headers())
+                if response.status_code == 200:
+                    devices = response.json().get("devices", [])
+                    for device in devices:
+                        if device.get("name") == self.device_name:
+                            logger.info(f"Using existing device: {device.get('url')}")
+                            return device
 
             logger.info("No existing device found, creating a new one.")
-            create_response = requests.post(wdm_url, headers=headers, json=device_data)
-            if create_response.status_code == 200:
-                device = create_response.json()
-                logger.info(f"Created new device: {device.get('url')}")
-                return device
-            else:
-                logger.error(f"Failed to create device: {create_response.status_code} - {create_response.text}")
-                return None
+            return self._create_device()
         except Exception as e:
             logger.error(f"Error getting device info: {e}")
             return None
+
+    def _refresh_device_info(self):
+        self._delete_current_device()
+        self.device_info = self._get_device_info(force_create=True)
+        return self.device_info
 
     async def _connect_websocket(self):
         if not self.device_info:
@@ -90,6 +119,18 @@ class WebexWSClient:
                 ping_interval=30,
                 ping_timeout=10,
             )
+        except InvalidStatus as e:
+            status_code = getattr(getattr(e, "response", None), "status_code", None)
+            logger.error(
+                f"WebSocket connection failed: {type(e).__name__}: {e}\n"
+                f"  WS URL: {ws_url}\n"
+                f"  HTTP status: {status_code}\n"
+                f"  Device info keys: {list(self.device_info.keys()) if self.device_info else 'none'}"
+            )
+            if status_code == 404:
+                logger.warning("WebSocket URL returned 404, refreshing device registration and retrying on next loop.")
+                self._refresh_device_info()
+            raise
         except Exception as e:
             logger.error(
                 f"WebSocket connection failed: {type(e).__name__}: {e}\n"
