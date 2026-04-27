@@ -84,11 +84,19 @@ class WebexWSClient:
             raise Exception("No webSocketUrl in device info")
 
         logger.info(f"Connecting to WebSocket: {ws_url[:50]}...")
-        self.websocket = await websockets.connect(
-            ws_url,
-            ping_interval=30,
-            ping_timeout=10,
-        )
+        try:
+            self.websocket = await websockets.connect(
+                ws_url,
+                ping_interval=30,
+                ping_timeout=10,
+            )
+        except Exception as e:
+            logger.error(
+                f"WebSocket connection failed: {type(e).__name__}: {e}\n"
+                f"  WS URL: {ws_url}\n"
+                f"  Device info keys: {list(self.device_info.keys()) if self.device_info else 'none'}"
+            )
+            raise
 
         auth_message = {
             "id": str(uuid.uuid4()),
@@ -139,7 +147,7 @@ class WebexWSClient:
             except ConnectionClosed as e:
                 logger.warning(f"WebSocket connection closed: {e}")
             except Exception as e:
-                logger.error(f"WebSocket error: {e}")
+                logger.exception(f"WebSocket error: {e}")
 
             if self.running:
                 logger.info(f"Reconnecting in {reconnect_delay} seconds...")

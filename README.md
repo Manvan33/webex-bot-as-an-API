@@ -19,13 +19,29 @@ Build the image:
 docker build -t webex-bot-relay-api .
 ```
 
-Run the container:
+Run the container (standalone):
 
 ```bash
 docker run -p 8000:8000 webex-bot-relay-api
 ```
 
 The API is then available at `http://localhost:8000`.
+
+Run the container behind **Traefik** (assuming Traefik is already running and attached to an external network called `traefik`):
+
+```bash
+docker run -d \
+  --name webex-bot-relay-api \
+  --network traefik \
+  --label "traefik.enable=true" \
+  --label "traefik.http.routers.webex-bot-relay.rule=Host(\`webex-api.example.com\`)" \
+  --label "traefik.http.routers.webex-bot-relay.entrypoints=websecure" \
+  --label "traefik.http.routers.webex-bot-relay.tls.certresolver=letsencrypt" \
+  --label "traefik.http.services.webex-bot-relay.loadbalancer.server.port=8000" \
+  webex-bot-relay-api
+```
+
+Replace `webex-api.example.com` with your actual domain. Traefik will terminate TLS and proxy `https://webex-api.example.com` to port `8000` inside the container.
 
 ## Setup (local)
 
