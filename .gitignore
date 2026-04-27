@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+
+# Logs
+*.log
+log.json
+
+# webex-bot-examples runtime artifacts
+webex-bot-examples/
+
+# Secrets / env
+.env
+*.env
+cookies.json
+
+# Editor / local notes
+.vscode/

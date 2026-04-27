@@ -1,0 +1,17 @@
+[project]
+name = "webex-bot-relay-api"
+version = "0.1.0"
+description = "Relay API that sends messages to a Webex bot and waits for replies"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
+    "webexteamssdk>=1.7",
+    "websockets>=12.0",
+    "requests>=2.31.0",
+    "python-dotenv>=1.2.2",
+]
+
+[tool.uv]
+package = false
