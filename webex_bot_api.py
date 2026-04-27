@@ -420,20 +420,17 @@ async def _start_ws_loop(session: RelaySession) -> asyncio.Task:
     return asyncio.create_task(session.client._run_loop(), name=f"webex-ws-loop-{session.session_id[:8]}")
 
 
-app = FastAPI(title="Webex Bot Relay API", version="1.0.0")
-
-
-@app.on_event("startup")
-async def startup_event() -> None:
+@contextlib.asynccontextmanager
+async def lifespan(app: FastAPI):  # noqa: ARG001
     state.sessions.cleanup_task = asyncio.create_task(
         state.sessions.run_cleanup_loop(),
         name="relay-session-cleanup",
     )
-
-
-@app.on_event("shutdown")
-async def shutdown_event() -> None:
+    yield
     await state.shutdown()
+
+
+app = FastAPI(title="Webex Bot Relay API", version="1.0.0", lifespan=lifespan)
 
 
 @app.get("/health")

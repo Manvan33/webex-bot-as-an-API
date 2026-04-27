@@ -11,7 +11,23 @@ This API lets you send messages to a Webex bot and collect the bot's reply event
 - Closes idle sessions 5 minutes after the last /chat call.
 - Returns all matching bot events collected during the requested time window.
 
-## Setup
+## Docker
+
+Build the image:
+
+```bash
+docker build -t webex-bot-relay-api .
+```
+
+Run the container:
+
+```bash
+docker run -p 8000:8000 webex-bot-relay-api
+```
+
+The API is then available at `http://localhost:8000`.
+
+## Setup (local)
 
 1. Install uv if you do not already have it.
 2. Create a local environment and install dependencies:

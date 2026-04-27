@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.log
+log.json
+.git/
+.gitignore
+.vscode/
+FINDINGS.md
+main.py
+client_implementation.py
+README.md
