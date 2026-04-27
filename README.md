@@ -1,12 +1,12 @@
 # Webex Bot Relay API
 
-This API lets you send messages to a Webex bot and collect the bot's reply events in the same HTTP request.
+This API lets you send messages to a Webex bot and collect the bot's reply messages in the same HTTP request.
 
 ## What It Does
 
 - Uses your personal Webex token to authenticate.
 - Sends messages to a bot email address.
-- Listens for Webex conversation events over WebSocket.
+- Waits for the requested collect window, then fetches recent room messages over the Webex REST API.
 - Reuses one in-memory Webex session per user token.
 - Closes idle sessions 5 minutes after the last /chat call.
 - Returns all matching bot events collected during the requested time window.
@@ -72,7 +72,7 @@ Returns the current process health and active in-memory session count.
 
 ### POST /chat
 
-Sends a message to a bot, reusing an existing session for the supplied Webex token if one is already active.
+Sends a message to a bot, reusing an existing session for the supplied Webex token if one is already active. The API waits for `collect_ms`, then fetches recent room messages once and returns bot replies sent after the original message.
 
 Request body:
 
@@ -131,4 +131,5 @@ curl -X POST http://localhost:8000/chat \
 - The API always uses the internal Webex device name `api-relay-client`.
 - Reusing the same `user_token` reuses the same Webex session until it has been idle for more than 5 minutes.
 - If the process restarts, all sessions are lost and will be recreated on the next `/chat` call.
-- If your bot responds with attachments only and no text, the `events` list may be empty.
+- If your bot responds after the `collect_ms` delay ends, that reply will not appear in the current response.
+- If your bot responds with attachments only and no text or markdown, the `events` list may be empty.

@@ -2,17 +2,16 @@ import asyncio
 import base64
 import contextlib
 import hashlib
+import itertools
 import logging
 import re
-import uuid
-from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from WebexWSClient import WebexWSClient
+from webex_api_client import WebexApiClient
 
 logging.basicConfig(
     level=logging.WARNING,
@@ -53,14 +52,11 @@ DEFAULT_DEVICE_NAME = "api-relay-client"
 
 
 class RelaySession:
-    def __init__(self, session_id: str, client: WebexWSClient, device_name: str) -> None:
+    def __init__(self, session_id: str, client: WebexApiClient, device_name: str) -> None:
         self.session_id = session_id
         self.client = client
         self.device_name = device_name
-        self.ws_task: Optional[asyncio.Task] = None
         self.bot_id_by_email: Dict[str, str] = {}
-        self.room_targets: Dict[str, tuple[str, str]] = {}
-        self.collectors_by_room: Dict[str, list[dict]] = defaultdict(list)
         self.lock = asyncio.Lock()
         self.last_used_at = datetime.now(timezone.utc)
 
@@ -72,20 +68,7 @@ class RelaySession:
         return current - self.last_used_at > SESSION_IDLE_TIMEOUT
 
     async def stop(self) -> None:
-        self.client.running = False
-        if self.client.websocket:
-            with contextlib.suppress(Exception):
-                await self.client.websocket.close()
-
-        if self.ws_task:
-            self.ws_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self.ws_task
-
-        self.ws_task = None
         self.bot_id_by_email.clear()
-        self.room_targets.clear()
-        self.collectors_by_room.clear()
 
 
 class SessionManager:
@@ -116,12 +99,11 @@ class SessionManager:
                 existing.touch()
                 return existing
 
-            client = WebexWSClient(access_token=user_token, device_name=DEFAULT_DEVICE_NAME)
+            client = WebexApiClient(access_token=user_token, device_name=DEFAULT_DEVICE_NAME)
             if not client.my_id:
                 raise ValueError("Invalid Webex user token.")
 
             session = RelaySession(session_id=session_id, client=client, device_name=DEFAULT_DEVICE_NAME)
-            session.ws_task = await _start_ws_loop(session)
             self.sessions[session_id] = session
 
         return session
@@ -179,14 +161,14 @@ UUID_RE = re.compile(
 )
 
 
-async def _resolve_person_id(client: WebexWSClient, email: str) -> Optional[str]:
+async def _resolve_person_id(client: WebexApiClient, email: str) -> Optional[str]:
     people = await asyncio.to_thread(client.api.people.list, email=email)
     for person in people:
         return person.id
     return None
 
 
-async def _fetch_message_text(client: WebexWSClient, message_id: str) -> dict:
+async def _fetch_message_text(client: WebexApiClient, message_id: str) -> dict:
     message = await asyncio.to_thread(client.api.messages.get, message_id)
     return {
         "id": message.id,
@@ -201,12 +183,6 @@ async def _fetch_message_text(client: WebexWSClient, message_id: str) -> dict:
 
 def _token_hash(user_token: str) -> str:
     return hashlib.sha256(user_token.encode("utf-8")).hexdigest()
-
-
-def _activity_uuid_to_message_id(activity_uuid: str) -> str:
-    """Convert a raw Webex activity UUID to the global message ID the messages API expects."""
-    raw = f"ciscospark://us/MESSAGE/{activity_uuid}"
-    return base64.b64encode(raw.encode()).decode().rstrip("=")
 
 
 def _extract_uuid_from_person_id(value: Optional[str]) -> Optional[str]:
@@ -293,15 +269,40 @@ def _message_sort_key(message: dict) -> datetime:
     return datetime.min.replace(tzinfo=timezone.utc)
 
 
-def _drain_collector_queue(queue: asyncio.Queue) -> list[dict]:
-    items: list[dict] = []
-    while True:
-        try:
-            items.append(queue.get_nowait())
-        except asyncio.QueueEmpty:
-            break
-    items.sort(key=_message_sort_key)
-    return items
+def _message_matches_bot(message: dict, expected_bot_id: str, expected_bot_email: str) -> bool:
+    actor = {
+        "id": message.get("person_id"),
+        "entryUUID": _extract_uuid_from_person_id(message.get("person_id")),
+        "emailAddress": message.get("person_email"),
+    }
+    return _is_bot_actor(actor, expected_bot_id, expected_bot_email)
+
+
+async def _list_recent_room_messages(client: WebexApiClient, room_id: str, limit: int = 50) -> list[dict]:
+    def _fetch_messages() -> list[dict]:
+        messages_iter = client.api.messages.list(roomId=room_id)
+        payload: list[dict] = []
+        for message in itertools.islice(messages_iter, limit):
+            payload.append(
+                {
+                    "id": getattr(message, "id", None),
+                    "text": getattr(message, "text", None) or "",
+                    "markdown": getattr(message, "markdown", None) or None,
+                    "created": getattr(message, "created", None),
+                    "room_id": getattr(message, "roomId", None),
+                    "person_id": getattr(message, "personId", None),
+                    "person_email": getattr(message, "personEmail", None),
+                    "activity_id": None,
+                    "parent_type": None,
+                    "parent_activity_id": None,
+                    "verb": "post",
+                }
+            )
+        return payload
+
+    messages = await asyncio.to_thread(_fetch_messages)
+    messages.sort(key=_message_sort_key)
+    return messages
 
 
 def _build_chat_response(room_id: str, bot_email: str, events_payload: list[dict]) -> ChatResponse:
@@ -334,92 +335,6 @@ def _build_chat_response(room_id: str, bot_email: str, events_payload: list[dict
     )
 
 
-async def _on_webex_event(session: RelaySession, event: dict) -> None:
-    data = event.get("data", {})
-    event_type = data.get("eventType") or event.get("eventType") or event.get("type")
-    if event_type and event_type != "conversation.activity":
-        return
-
-    activity = data.get("activity", {}) or event.get("activity", {})
-    verb = str(activity.get("verb") or "").lower()
-    parent = activity.get("parent", {})
-    parent_type = str(parent.get("type") or "").lower()
-    parent_id = parent.get("id")
-    activity_id = activity.get("id")
-    object_id = activity.get("object", {}).get("id")
-    room_id_hint = activity.get("target", {}).get("globalId")
-
-    if not room_id_hint:
-        return
-
-    async with session.lock:
-        target = session.room_targets.get(room_id_hint)
-    if not target:
-        return
-
-    expected_bot_id, expected_bot_email = target
-
-    if verb not in {"post", "update", "replace"}:
-        return
-
-    actor = activity.get("actor", {})
-    actor_id = actor.get("id")
-    if not _is_bot_actor(actor, expected_bot_id, expected_bot_email):
-        return
-
-    object_id = activity.get("object", {}).get("id")
-    activity_id = activity.get("id")
-    if object_id:
-        message_id = object_id
-    elif activity_id:
-        message_id = _activity_uuid_to_message_id(activity_id)
-    else:
-        return
-
-    try:
-        message = await _fetch_message_text(session.client, message_id)
-    except Exception as exc:
-        logger.warning("Could not fetch message %s: %s", message_id, exc)
-        return
-
-    parent = activity.get("parent", {})
-    message["activity_id"] = activity_id
-    message["parent_activity_id"] = parent.get("id")
-    message["parent_type"] = parent.get("type")
-    message["verb"] = verb
-    if not message.get("created"):
-        message["created"] = activity.get("published")
-
-    room_id = message.get("room_id")
-    text = (message.get("text") or "").strip()
-    markdown = (message.get("markdown") or "").strip()
-    if not room_id or not (text or markdown):
-        return
-
-    async with session.lock:
-        collectors = list(session.collectors_by_room.get(room_id, []))
-
-    for collector in collectors:
-        if collector.get("bot_id") != expected_bot_id:
-            continue
-
-        sent_created = collector.get("sent_created")
-        if sent_created and not _message_is_after_sent(message, sent_created):
-            continue
-
-        queue: asyncio.Queue = collector["queue"]
-        queue.put_nowait(message)
-
-
-async def _start_ws_loop(session: RelaySession) -> asyncio.Task:
-    async def _listener(event: dict) -> None:
-        await _on_webex_event(session, event)
-
-    session.client.add_event_listener(_listener)
-    session.client.running = True
-    return asyncio.create_task(session.client._run_loop(), name=f"webex-ws-loop-{session.session_id[:8]}")
-
-
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):  # noqa: ARG001
     state.sessions.cleanup_task = asyncio.create_task(
@@ -443,8 +358,6 @@ def health() -> dict:
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest) -> ChatResponse:
-    trace_id = str(uuid.uuid4())[:8]
-
     try:
         session = await state.sessions.get_or_create(request.user_token)
     except ValueError as exc:
@@ -471,7 +384,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
             text=request.message,
         )
     except Exception as exc:
-        logger.exception("chat[%s] send_message failed", trace_id)
+        logger.exception("send_message failed")
         raise HTTPException(status_code=502, detail=f"Failed to send message to bot: {exc}") from exc
 
     room_id = getattr(sent, "roomId", None)
@@ -480,35 +393,24 @@ async def chat(request: ChatRequest) -> ChatResponse:
         raise HTTPException(status_code=500, detail="Webex did not return a roomId for the sent message.")
 
     async with session.lock:
-        session.room_targets[room_id] = (bot_id, bot_email)
-
-    collector_queue: asyncio.Queue = asyncio.Queue()
-    collector = {
-        "queue": collector_queue,
-        "bot_id": bot_id,
-        "sent_created": sent_created,
-    }
-
-    async with session.lock:
-        session.collectors_by_room[room_id].append(collector)
         session.touch()
 
     await asyncio.sleep(request.collect_ms / 1000.0)
 
-    async with session.lock:
-        collectors = session.collectors_by_room.get(room_id, [])
-        with contextlib.suppress(ValueError):
-            collectors.remove(collector)
-        if not collectors:
-            session.collectors_by_room.pop(room_id, None)
-        session.touch()
+    try:
+        room_messages = await _list_recent_room_messages(session.client, room_id)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch room messages: {exc}") from exc
 
-    events_payload = _drain_collector_queue(collector_queue)
-    logger.info(
-        "chat[%s] collected_events=%s session=%s room_id=%s",
-        trace_id,
-        len(events_payload),
-        session.session_id[:8],
-        room_id,
-    )
+    events_payload = [
+        message
+        for message in room_messages
+        if _message_matches_bot(message, bot_id, bot_email)
+        and _message_is_after_sent(message, sent_created)
+        and ((message.get("text") or "").strip() or (message.get("markdown") or "").strip())
+    ]
+    events_payload.sort(key=_message_sort_key)
+
+    async with session.lock:
+        session.touch()
     return _build_chat_response(room_id, bot_email, events_payload)
