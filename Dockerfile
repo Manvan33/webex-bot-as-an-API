@@ -12,7 +12,7 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 
 # Copy application source
-COPY webex_bot_api.py WebexWSClient.py ./
+COPY webex_bot_api.py webex_api_client.py ./
 
 EXPOSE 8000
 
