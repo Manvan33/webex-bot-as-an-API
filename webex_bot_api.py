@@ -1,11 +1,11 @@
 import asyncio
 import base64
 import contextlib
-import hashlib
 import itertools
 import logging
 import re
-from datetime import datetime, timedelta, timezone
+import uuid
+from datetime import datetime, timezone
 from typing import Dict, Optional
 
 from fastapi import FastAPI, HTTPException
@@ -25,6 +25,7 @@ class ChatRequest(BaseModel):
     bot_email: str = Field(min_length=3)
     message: str = Field(min_length=1, max_length=7439)
     collect_ms: int = Field(default=4000, ge=100, le=120000)
+    delete_room: bool = Field(default=False)
 
 
 class ChatEvent(BaseModel):
@@ -46,114 +47,9 @@ class ChatResponse(BaseModel):
     bot_email: str
 
 
-SESSION_IDLE_TIMEOUT = timedelta(minutes=5)
-CLEANUP_INTERVAL_SECONDS = 30
-DEFAULT_DEVICE_NAME = "api-relay-client"
-
-
-class RelaySession:
-    def __init__(self, session_id: str, client: WebexApiClient, device_name: str) -> None:
-        self.session_id = session_id
-        self.client = client
-        self.device_name = device_name
-        self.bot_id_by_email: Dict[str, str] = {}
-        self.lock = asyncio.Lock()
-        self.last_used_at = datetime.now(timezone.utc)
-
-    def touch(self, when: Optional[datetime] = None) -> None:
-        self.last_used_at = when or datetime.now(timezone.utc)
-
-    def is_expired(self, now: Optional[datetime] = None) -> bool:
-        current = now or datetime.now(timezone.utc)
-        return current - self.last_used_at > SESSION_IDLE_TIMEOUT
-
-    async def stop(self) -> None:
-        self.bot_id_by_email.clear()
-
-
-class SessionManager:
-    def __init__(self) -> None:
-        self.sessions: Dict[str, RelaySession] = {}
-        self.lock = asyncio.Lock()
-        self.cleanup_task: Optional[asyncio.Task] = None
-
-    async def get_or_create(self, user_token: str) -> RelaySession:
-        session_id = _token_hash(user_token)
-        expired_session: Optional[RelaySession] = None
-        async with self.lock:
-            existing = self.sessions.get(session_id)
-            if existing and existing.is_expired():
-                expired_session = self.sessions.pop(session_id)
-                existing = None
-
-            if existing:
-                existing.touch()
-                return existing
-
-        if expired_session:
-            await expired_session.stop()
-
-        async with self.lock:
-            existing = self.sessions.get(session_id)
-            if existing:
-                existing.touch()
-                return existing
-
-            client = WebexApiClient(access_token=user_token, device_name=DEFAULT_DEVICE_NAME)
-            if not client.my_id:
-                raise ValueError("Invalid Webex user token.")
-
-            session = RelaySession(session_id=session_id, client=client, device_name=DEFAULT_DEVICE_NAME)
-            self.sessions[session_id] = session
-
-        return session
-
-    async def expire_idle_sessions(self) -> None:
-        now = datetime.now(timezone.utc)
-        expired_sessions: list[RelaySession] = []
-        async with self.lock:
-            for session_id, session in list(self.sessions.items()):
-                if session.is_expired(now):
-                    expired_sessions.append(self.sessions.pop(session_id))
-
-        for session in expired_sessions:
-            await session.stop()
-
-    async def run_cleanup_loop(self) -> None:
-        try:
-            while True:
-                await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
-                await self.expire_idle_sessions()
-        except asyncio.CancelledError:
-            raise
-
-    async def shutdown(self) -> None:
-        if self.cleanup_task:
-            self.cleanup_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self.cleanup_task
-            self.cleanup_task = None
-
-        async with self.lock:
-            sessions = list(self.sessions.values())
-            self.sessions.clear()
-
-        for session in sessions:
-            await session.stop()
-
-    def active_count(self) -> int:
-        return len(self.sessions)
-
-
-class AppState:
-    def __init__(self) -> None:
-        self.sessions = SessionManager()
-
-    async def shutdown(self) -> None:
-        await self.sessions.shutdown()
-
-
-state = AppState()
+# Module-level bot ID cache (bot_email → person_id). Global across all requests.
+_bot_id_cache: Dict[str, str] = {}
+_bot_id_lock = asyncio.Lock()
 
 
 UUID_RE = re.compile(
@@ -161,28 +57,19 @@ UUID_RE = re.compile(
 )
 
 
-async def _resolve_person_id(client: WebexApiClient, email: str) -> Optional[str]:
-    people = await asyncio.to_thread(client.api.people.list, email=email)
+async def _resolve_bot_id(client: WebexApiClient, bot_email: str) -> Optional[str]:
+    """Resolve bot email to person ID, using module-level cache."""
+    async with _bot_id_lock:
+        cached = _bot_id_cache.get(bot_email)
+    if cached:
+        return cached
+
+    people = await asyncio.to_thread(client.api.people.list, email=bot_email)
     for person in people:
+        async with _bot_id_lock:
+            _bot_id_cache[bot_email] = person.id
         return person.id
     return None
-
-
-async def _fetch_message_text(client: WebexApiClient, message_id: str) -> dict:
-    message = await asyncio.to_thread(client.api.messages.get, message_id)
-    return {
-        "id": message.id,
-        "text": getattr(message, "text", None) or "",
-        "markdown": getattr(message, "markdown", None) or None,
-        "created": getattr(message, "created", None),
-        "room_id": getattr(message, "roomId", None),
-        "person_id": getattr(message, "personId", None),
-        "person_email": getattr(message, "personEmail", None),
-    }
-
-
-def _token_hash(user_token: str) -> str:
-    return hashlib.sha256(user_token.encode("utf-8")).hexdigest()
 
 
 def _extract_uuid_from_person_id(value: Optional[str]) -> Optional[str]:
@@ -335,82 +222,92 @@ def _build_chat_response(room_id: str, bot_email: str, events_payload: list[dict
     )
 
 
-@contextlib.asynccontextmanager
-async def lifespan(app: FastAPI):  # noqa: ARG001
-    state.sessions.cleanup_task = asyncio.create_task(
-        state.sessions.run_cleanup_loop(),
-        name="relay-session-cleanup",
-    )
-    yield
-    await state.shutdown()
-
-
-app = FastAPI(title="Webex Bot Relay API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Webex Bot Relay API", version="1.0.0")
 
 
 @app.get("/health")
 def health() -> dict:
-    return {
-        "ok": True,
-        "active_sessions": state.sessions.active_count(),
-    }
+    return {"ok": True}
 
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest) -> ChatResponse:
-    try:
-        session = await state.sessions.get_or_create(request.user_token)
-    except ValueError as exc:
-        raise HTTPException(status_code=401, detail=str(exc)) from exc
-
     bot_email = request.bot_email.strip().lower()
     if not bot_email:
         raise HTTPException(status_code=400, detail="bot_email is required.")
 
-    async with session.lock:
-        bot_id = session.bot_id_by_email.get(bot_email)
+    # Create a per-request Webex client
+    client = await asyncio.to_thread(
+        WebexApiClient, access_token=request.user_token, device_name="api-relay-client"
+    )
+    if not client.my_id:
+        raise HTTPException(status_code=401, detail="Invalid Webex user token.")
 
+    # Resolve bot person ID (cached globally)
+    bot_id = await _resolve_bot_id(client, bot_email)
     if not bot_id:
-        bot_id = await _resolve_person_id(session.client, bot_email)
-        if not bot_id:
-            raise HTTPException(status_code=404, detail="Bot email not found in Webex people directory.")
-        async with session.lock:
-            session.bot_id_by_email[bot_email] = bot_id
+        raise HTTPException(status_code=404, detail="Bot email not found in Webex people directory.")
 
+    # Create a temporary room for this interaction
+    short_id = str(uuid.uuid4())[:8]
+    room_title = f"relay-{short_id}"
     try:
-        sent = await asyncio.to_thread(
-            session.client.send_message,
-            to_person_email=bot_email,
-            text=request.message,
-        )
+        room = await asyncio.to_thread(client.create_room, room_title)
     except Exception as exc:
-        logger.exception("send_message failed")
-        raise HTTPException(status_code=502, detail=f"Failed to send message to bot: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"Failed to create temporary room: {exc}") from exc
 
-    room_id = getattr(sent, "roomId", None)
-    sent_created = getattr(sent, "created", None)
+    room_id = getattr(room, "id", None)
     if not room_id:
-        raise HTTPException(status_code=500, detail="Webex did not return a roomId for the sent message.")
-
-    async with session.lock:
-        session.touch()
-
-    await asyncio.sleep(request.collect_ms / 1000.0)
+        raise HTTPException(status_code=500, detail="Webex did not return a room ID for the created room.")
 
     try:
-        room_messages = await _list_recent_room_messages(session.client, room_id)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch room messages: {exc}") from exc
+        # Invite the bot to the room
+        try:
+            await asyncio.to_thread(client.add_member, room_id, person_email=bot_email)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Failed to invite bot to room: {exc}") from exc
 
-    events_payload = [
-        message
-        for message in room_messages
-        if _message_matches_bot(message, bot_id, bot_email)
-        and _message_is_after_sent(message, sent_created)
-        and ((message.get("text") or "").strip() or (message.get("markdown") or "").strip())
-    ]
-    events_payload.sort(key=_message_sort_key)
+        # Brief wait for bot membership propagation
+        await asyncio.sleep(2)
 
-    async with session.lock:
-        session.touch()
-    return _build_chat_response(room_id, bot_email, events_payload)
+        # Send the query with @mention so bot is notified
+        mention_text = f"<@personEmail:{bot_email}> {request.message}"
+        try:
+            sent = await asyncio.to_thread(
+                client.send_message,
+                room_id=room_id,
+                text=request.message,
+                markdown=mention_text,
+            )
+        except Exception as exc:
+            logger.exception("send_message failed")
+            raise HTTPException(status_code=502, detail=f"Failed to send message to bot: {exc}") from exc
+
+        sent_created = getattr(sent, "created", None)
+
+        # Wait for the bot to reply
+        await asyncio.sleep(request.collect_ms / 1000.0)
+
+        # Fetch all messages from the temporary room
+        try:
+            room_messages = await _list_recent_room_messages(client, room_id)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Failed to fetch room messages: {exc}") from exc
+
+        # Filter to bot replies after our sent message
+        events_payload = [
+            message
+            for message in room_messages
+            if _message_matches_bot(message, bot_id, bot_email)
+            and _message_is_after_sent(message, sent_created)
+            and ((message.get("text") or "").strip() or (message.get("markdown") or "").strip())
+        ]
+        events_payload.sort(key=_message_sort_key)
+
+        return _build_chat_response(room_id, bot_email, events_payload)
+
+    finally:
+        # Cleanup: delete room if requested
+        if request.delete_room:
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(client.delete_room, room_id)

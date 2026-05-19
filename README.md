@@ -6,10 +6,11 @@ This API lets you send messages to a Webex bot and collect the bot's reply messa
 
 - Uses your personal Webex token to authenticate.
 - Sends messages to a bot email address.
-- Waits for the requested collect window, then fetches recent room messages over the Webex REST API.
+- Creates a temporary Webex space per request for clean reply isolation.
+- Invites the bot, sends the query with an @mention, waits for the collect window, then fetches replies.
 - Reuses one in-memory Webex session per user token.
 - Closes idle sessions 5 minutes after the last /chat call.
-- Returns all matching bot events collected during the requested time window.
+- Optionally deletes the temporary room after collecting replies (`delete_room`).
 
 ## Docker
 
@@ -72,7 +73,7 @@ Returns the current process health and active in-memory session count.
 
 ### POST /chat
 
-Sends a message to a bot, reusing an existing session for the supplied Webex token if one is already active. The API waits for `collect_ms`, then fetches recent room messages once and returns bot replies sent after the original message.
+Sends a message to a bot via a dedicated temporary Webex room. The API creates a room, invites the bot, sends the query with an @mention, waits `collect_ms`, fetches replies, and optionally deletes the room.
 
 Request body:
 
@@ -81,7 +82,8 @@ Request body:
   "user_token": "<YOUR_PERSONAL_WEBEX_TOKEN>",
   "bot_email": "my-bot@webex.bot",
   "message": "Hello",
-  "collect_ms": 4000
+  "collect_ms": 4000,
+  "delete_room": true
 }
 ```
 
@@ -131,5 +133,7 @@ curl -X POST http://localhost:8000/chat \
 - The API always uses the internal Webex device name `api-relay-client`.
 - Reusing the same `user_token` reuses the same Webex session until it has been idle for more than 5 minutes.
 - If the process restarts, all sessions are lost and will be recreated on the next `/chat` call.
+- Each `/chat` call creates a new temporary Webex space, ensuring replies are always isolated to the query.
+- Set `delete_room` to `true` to clean up the space after collection; defaults to `false` (room stays hidden).
 - If your bot responds after the `collect_ms` delay ends, that reply will not appear in the current response.
 - If your bot responds with attachments only and no text or markdown, the `events` list may be empty.

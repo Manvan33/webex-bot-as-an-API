@@ -30,3 +30,31 @@ class WebexApiClient:
         except ApiError as e:
             logger.error(f"Failed to send message: {e}")
             raise
+
+    def create_room(self, title: str):
+        """Create a new Webex room and return the room object."""
+        try:
+            return self.api.rooms.create(title=title)
+        except ApiError as e:
+            logger.error(f"Failed to create room: {e}")
+            raise
+
+    def add_member(self, room_id: str, person_email: str = None, person_id: str = None):
+        """Add a person to a room by email or person ID."""
+        try:
+            return self.api.memberships.create(
+                roomId=room_id,
+                personEmail=person_email,
+                personId=person_id,
+            )
+        except ApiError as e:
+            logger.error(f"Failed to add member: {e}")
+            raise
+
+    def delete_room(self, room_id: str):
+        """Delete a Webex room."""
+        try:
+            return self.api.rooms.delete(room_id)
+        except ApiError as e:
+            logger.error(f"Failed to delete room: {e}")
+            raise

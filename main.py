@@ -5,8 +5,8 @@ from typing import Optional
 import requests
 
 
-MITM_PROXY = None
-# MITM_PROXY = "http://127.0.0.1:8111"
+# MITM_PROXY = None
+MITM_PROXY = "http://127.0.0.1:8111"
 
 
 def _build_http_client() -> requests.Session:
@@ -34,6 +34,7 @@ def send_message(
         "bot_email": bot_email,
         "message": message,
         "collect_ms": collect_ms,
+        "delete_room": False,
     }
 
     try:
@@ -114,24 +115,25 @@ def _extract_replies(payload: object) -> list[str]:
 def main() -> None:
     print("Webex Bot Relay Interactive Client")
     print(f"Proxy: {MITM_PROXY}")
-    base_url = input("API URL [http://10.228.225.55:8000]: ").strip() or "http://10.228.225.55:8000"
-    user_token = getpass.getpass("Personal Webex token: ").strip()
+    base_url = (input("API URL [http://host.docker.internal:8100]: ").strip() or "http://host.docker.internal:8100").rstrip("/")
+    # user_token = getpass.getpass("Personal Webex token: ").strip()
+    user_token = 'Mjk1NzYzOWMtMDc2My00N2ZiLWJhMWUtMjhjNjUzMzlkMjJhOTg2M2E5N2ItN2Yx_PF84_1eb65fdf-9643-417f-9974-ad72cae0e10f'
     if not user_token:
         print("A Webex token is required. Exiting.")
         return
 
-    collect_seconds_raw = input("Collect window in seconds [4]: ").strip() or "4"
+    collect_seconds_raw = input("Collect window in seconds [5]: ").strip() or "5"
     http_client = _build_http_client()
 
     try:
         collect_seconds = max(1, int(collect_seconds_raw))
     except ValueError:
-        print("Invalid collect window. Using default of 4 seconds.")
-        collect_seconds = 4
+        print("Invalid collect window. Using default of 5 seconds.")
+        collect_seconds = 5
 
     collect_ms = collect_seconds * 1000
 
-    bot_email = input("Bot email [enterprise-chat-ai@webex.bot]: ").strip() or "enterprise-chat-ai@webex.bot"
+    bot_email = input("Bot email [enterprise-chat-ai@webex.bot]: ").strip() or "ccwbot@webex.bot"
 
     print("\nChat ready. Type a message and press Enter.")
     print("Commands: /exit, /quit, /bot <email>")
