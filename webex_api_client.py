@@ -11,7 +11,7 @@ class WebexApiClient:
     def __init__(self, access_token, device_name="python-ws-client"):
         self.access_token = access_token
         self.device_name = device_name
-        self.api = WebexTeamsAPI(access_token=access_token)
+        self.api = WebexTeamsAPI(access_token=access_token, disable_ssl_verify=True)
 
         try:
             me = self.api.people.me()
