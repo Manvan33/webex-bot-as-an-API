@@ -250,7 +250,8 @@ async def chat(request: ChatRequest) -> ChatResponse:
 
     # Create a temporary room for this interaction
     short_id = str(uuid.uuid4())[:8]
-    room_title = f"relay-{short_id}"
+    bot_name = bot_email.split("@")[0]  # extract local part of email
+    room_title = f"relay-{bot_name}-{short_id}"
     try:
         room = await asyncio.to_thread(client.create_room, room_title)
     except Exception as exc:
